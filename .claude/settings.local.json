@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install *)",
+      "Bash(python -c \"import undetected_chromedriver as uc; print\\('OK'\\)\")",
+      "Bash(which brave-browser *)",
+      "Read(//usr/bin/**)",
+      "Bash(brave-browser --version)",
+      "Bash(python -c \"import undetected_chromedriver as uc; print\\(uc.__version__\\)\")",
+      "Bash(ls ~/.config/BraveSoftware/Brave-Browser/ 2>/dev/null | head -10)",
+      "Read(//home/ryan/.config/BraveSoftware/**)",
+      "Bash(find ~/.config -maxdepth 3 -name \"Preferences\" 2>/dev/null | grep -i brave | head -5)",
+      "Read(//home/ryan/.config/**)",
+      "Bash(find /home/ryan -maxdepth 5 -name \"Preferences\" 2>/dev/null | grep -i brave | head -5; find /home/ryan -maxdepth 4 -type d -name \"*Brave*\" 2>/dev/null | head -5)",
+      "Read(//home/ryan/**)",
+      "Bash(python3 -c ' *)",
+      "Bash(python -c \"import requests, imaplib, logging; print\\('OK'\\)\")"
+    ]
+  }
+}
