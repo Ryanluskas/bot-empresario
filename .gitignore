@@ -5,7 +5,9 @@
 .env.*
 !.env.example
 *.env
+credentials.json
 credenciais.ini
+.inst_identity
 client_secret*.json
 *secret*.json
 serviceAccount*.json
@@ -47,6 +49,9 @@ build/
 
 # Perfis de navegador / sessao
 chrome_profile*/
+brave_profile*/
+data/
+logs/
 *.whatsapp-profile*/
 *.simulator-profile*/
 .locks/

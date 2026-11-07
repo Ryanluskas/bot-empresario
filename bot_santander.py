@@ -13,6 +13,8 @@ import queue as _queue_mod
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
+import security_config
+
 try:
     from playwright_stealth import stealth_sync
     _STEALTH_LIB = True
@@ -50,8 +52,8 @@ def _achar_brave() -> str:
 
 BRAVE_EXE       = _achar_brave()
 TIMEOUT         = 25_000
-CPF_ACESSO      = "70958933146"
-SENHA_ACESSO    = "Capi095@"
+CPF_ACESSO, SENHA_ACESSO = security_config.load_credentials()
+# Credenciais isoladas via security_config (sem segredos em texto puro)
 
 # Pausa rápida a cada N clientes (simula humano virando a página, não dorme)
 BURST_MIN    = 8
@@ -630,20 +632,34 @@ def carregar_dados() -> pd.DataFrame:
 # FORMULÁRIO
 # ---------------------------------------------------------------------------
 def aguardar_formulario(page):
-    for tentativa in range(3):
+    for tentativa in range(4):
+        # 1. Verifica se já está no formulário (label Nome aparece)
         try:
-            page.wait_for_selector('label', timeout=12_000)
             if page.locator('label').filter(has_text="Nome").count() > 0:
                 return
-            time.sleep(2)
-            if page.locator('label').filter(has_text="Nome").count() > 0:
-                return
-            if page.locator('button:has-text("Ver produtos")').count() > 0:
-                return
+        except Exception:
+            pass
+
+        # 2. Verifica se está na tela inicial logada com o botão/link "Ver produtos" e sem o formulário
+        try:
+            ver_produtos = page.locator('text="Ver produtos"')
+            if ver_produtos.count() > 0 and ver_produtos.first.is_visible(timeout=2000):
+                ver_produtos.first.click()
+                time.sleep(1.5)
+                if page.locator('label').filter(has_text="Nome").count() > 0:
+                    return
+        except Exception:
+            pass
+
+        # 3. Se não achou nenhum de imediato, aguarda o form carregar
+        try:
+            page.wait_for_selector('label:has-text("Nome")', timeout=8000)
+            return
         except PlaywrightTimeoutError:
             pass
-        if tentativa < 2:
-            time.sleep(3)
+            
+        time.sleep(2)
+        
     raise PlaywrightTimeoutError("Formulário não encontrado após 3 tentativas")
 
 
@@ -762,7 +778,7 @@ def _confirmar_cancelamento(page):
 
 def _no_formulario(page) -> bool:
     try:
-        return page.locator('button:has-text("Ver produtos")').is_visible()
+        return page.locator('label').filter(has_text="Nome").is_visible()
     except Exception:
         return False
 
@@ -774,7 +790,13 @@ def voltar_ao_formulario(page):
     for _ in range(4):
         try:
             page.go_back(wait_until="domcontentloaded", timeout=5000)
-            time.sleep(0.8)
+            
+            # Espera inteligente ao invés de sleep fixo de 0.8s
+            try:
+                page.wait_for_selector('button:has-text("Ver produtos")', timeout=1200)
+            except Exception:
+                pass
+                
             _confirmar_cancelamento(page)
             if _no_formulario(page):
                 return
@@ -871,8 +893,9 @@ def processar_clientes(page, df: pd.DataFrame) -> pd.DataFrame:
             print(f"[{idx+1}/{total}] CPF inválido, pulando.")
             continue
 
-        print(f"[{idx+1}/{total}] {nome[:28]:<28} CPF: {cpf} ...", end=" ", flush=True)
-        logger.info(f"[{idx+1}/{total}] {nome} CPF: {cpf}")
+        cpf_mascarado = security_config.mask_cpf(cpf)
+        print(f"[{idx+1}/{total}] {nome[:28]:<28} CPF: {cpf_mascarado} ...", end=" ", flush=True)
+        logger.info(f"[{idx+1}/{total}] {nome} CPF: {cpf_mascarado}")
 
         _keepalive(page)
         _fechar_abas_extras(page.context, page)
@@ -885,8 +908,8 @@ def processar_clientes(page, df: pd.DataFrame) -> pd.DataFrame:
             processados_no_burst = 0
             proximo_descanso = random.randint(BURST_MIN, BURST_MAX)
 
-        # Pausa entre clientes
-        time.sleep(random.uniform(4.0, 7.0))
+        # Pausa entre clientes (reduzida de 4-7s para 1.5-2.5s, mantendo aleatoriedade)
+        time.sleep(random.uniform(1.5, 2.5))
 
         status = "Erro"
         for tentativa in range(2):
@@ -939,11 +962,16 @@ def processar_clientes(page, df: pd.DataFrame) -> pd.DataFrame:
                     print("ERRO")
                     status = "Erro"
 
+        # Salva o Excel a cada 10 clientes para evitar o gargalo gigantesco de I/O
+        # (gravar um arquivo de 5MB a cada linha custa ~2 a 3 segundos por cliente)
         df.at[idx, "Tem_Emprestimo"] = status
-        salvar_excel(df, ARQUIVO_SAIDA)
-        df_sim = df[df["Tem_Emprestimo"] == "Sim"]
-        if not df_sim.empty:
-            salvar_excel(df_sim, "com_refinanciamento.xlsx")
+        
+        # Só salva o arquivo principal a cada 10 registros para otimizar
+        if processados_no_burst % 10 == 0 or idx == ordem[-1]:
+            salvar_excel(df, ARQUIVO_SAIDA)
+            df_sim = df[df["Tem_Emprestimo"] == "Sim"]
+            if not df_sim.empty:
+                salvar_excel(df_sim, "com_refinanciamento.xlsx")
 
         # Envia progresso para a GUI
         _status_queue.put({
@@ -976,7 +1004,7 @@ def processar_clientes(page, df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # MAIN GUI (chamado pela interface gráfica)
 # ---------------------------------------------------------------------------
-def main_gui():
+def main_gui(num_workers: int = 1, coordinator_holder: list = None):
     """Versão sem input() — sincroniza com a GUI via _start_event e _status_queue."""
     df = carregar_dados()
 
@@ -994,7 +1022,30 @@ def main_gui():
         "erros":  erros0,
     })
 
-    _status_queue.put({"type": "log", "msg": "Abrindo Brave..."})
+    _status_queue.put({"type": "log", "msg": f"Iniciando Bot com {num_workers} Brave(s)..."})
+
+    from multi_brave import MultiBraveCoordinator
+    coord = MultiBraveCoordinator(df, ARQUIVO_SAIDA, _status_queue, _stop_event)
+    if coordinator_holder is not None:
+        coordinator_holder.append(coord)
+
+    _status_queue.put({"type": "rodando"})
+    coord.start(num_workers)
+    coord.wait_all()
+
+    sim   = (coord.queue_mgr.df["Tem_Emprestimo"] == "Sim").sum()
+    nao   = (coord.queue_mgr.df["Tem_Emprestimo"] == "Não").sum()
+    erros = coord.queue_mgr.df["Tem_Emprestimo"].isin(["Erro", "CPF Inválido"]).sum()
+    _status_queue.put({"type": "log",
+                       "msg": f"Concluído! Sim={sim} | Não={nao} | Erros={erros}"})
+    _status_queue.put({"type": "stopped"})
+    return
+
+
+def main_gui_legacy():
+    """Modo legado com um único contexto persistente no perfil padrão."""
+    df = carregar_dados()
+    _status_queue.put({"type": "log", "msg": "Abrindo Brave (legado)..."})
 
     with sync_playwright() as pw:
         ctx = pw.chromium.launch_persistent_context(
