@@ -4,7 +4,7 @@ Set sh  = CreateObject("Wscript.Shell")
 base = fso.GetParentFolderName(WScript.ScriptFullName)
 sh.CurrentDirectory = base
 
-' Usa o venv da pasta se ele existir e apontar para um Python que esteja instalado
+' 1. Tenta pythonw no venv_win local
 py  = base & "\venv_win\Scripts\pythonw.exe"
 cfg = base & "\venv_win\pyvenv.cfg"
 usar_venv = False
@@ -21,6 +21,29 @@ If fso.FileExists(py) And fso.FileExists(cfg) Then
     f.Close
 End If
 
-If Not usar_venv Then py = "pythonw.exe"   ' cai para o Python do sistema
+' 2. Se o venv local nao for valido, procura pythonw nas instalacoes padrao do usuario
+If Not usar_venv Then
+    candidatos = Array( _
+        sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Programs\Python\Python312\pythonw.exe"), _
+        sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Programs\Python\Python313\pythonw.exe"), _
+        sh.ExpandEnvironmentStrings("%LOCALAPPDATA%\Programs\Python\Python311\pythonw.exe"), _
+        "C:\Program Files\Python312\pythonw.exe", _
+        "C:\Program Files\Python311\pythonw.exe" _
+    )
+    For Each c In candidatos
+        If fso.FileExists(c) Then
+            py = c
+            usar_venv = True
+            Exit For
+        End If
+    Next
+End If
+
+If Not usar_venv Then
+    MsgBox "Ambiente Python nao configurado!" & vbCrLf & vbCrLf & _
+           "Por favor, execute o arquivo 'Instalar.bat' nesta pasta para configurar o bot.", _
+           vbCritical, "Bot Santander"
+    WScript.Quit 1
+End If
 
 sh.Run """" & py & """ gui.py", 0, False
