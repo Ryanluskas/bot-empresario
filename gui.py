@@ -55,17 +55,6 @@ class BotApp(ctk.CTk):
         self._workers_data = {}
         self._sys_info = SystemResources.get_info()
 
-        # Inicialização do CoreGuard SDK
-        try:
-            from coreguard import CoreGuard
-            self.guard = CoreGuard(
-                product="bot_empresario",
-                server_url=os.getenv("COREGUARD_SERVER_URL", "http://127.0.0.1:8800"),
-                config_dir=os.path.dirname(os.path.abspath(__file__)),
-                auto_background_refresh=True
-            )
-        except Exception:
-            self.guard = None
 
         self._build_ui()
         self._poll()
@@ -580,21 +569,6 @@ class BotApp(ctk.CTk):
             self._iniciar()
 
     def _iniciar(self):
-        if hasattr(self, "guard") and self.guard:
-            if not self.guard.is_authorized():
-                from tkinter import simpledialog, messagebox
-                chave = simpledialog.askstring("Licença CoreGuard", "Insira a Chave de Ativação do Bot Empresário:", parent=self)
-                if chave:
-                    try:
-                        self.guard.activate(chave)
-                        messagebox.showinfo("CoreGuard", "Licença ativada com sucesso!")
-                    except Exception as exc:
-                        messagebox.showerror("CoreGuard", f"Falha na ativação: {exc}")
-                        return
-                else:
-                    messagebox.showwarning("CoreGuard", "Ativação necessária para iniciar o processamento.")
-                    return
-
         if self._running:
             return
         self._running = True
