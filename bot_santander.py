@@ -3,21 +3,18 @@ RPA - Parceiro Santander | Simulação de Crédito Consignado
 """
 
 import os
+import re
 import time
 import random
 import logging
-import pandas as pd
-
 import threading
 import queue as _queue_mod
+from urllib.parse import urlsplit
 
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
-
-try:
-    from playwright_stealth import stealth_sync
-    _STEALTH_LIB = True
-except ImportError:
-    _STEALTH_LIB = False
+import pandas as pd
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -26,6 +23,12 @@ ARQUIVO_ENTRADA = "clientes.csv"
 ARQUIVO_SAIDA   = "resultado_filtrado.xlsx"
 URL_FORMULARIO  = "https://www.parceirosantander.com.br/spa-base/logged-area/recommendation/"
 URL_LANDING     = "https://www.parceirosantander.com.br/spa-base/landing-page"
+_PORTAL = urlsplit(URL_FORMULARIO)
+_HOSTS_SANTANDER = {_PORTAL.hostname, "login.santander.com.br"}
+_ORIENTACAO_LOGIN = (
+    "No Brave, clique em Acessar o Portal e conclua o login, inclusive o código de verificação se solicitado. "
+    "Depois, abra a área de recomendação se ela não aparecer automaticamente."
+)
 PERFIL_DIR      = os.path.join(
     os.environ.get("LOCALAPPDATA", os.path.expanduser(r"~\AppData\Local")),
     r"BraveSoftware\Brave-Browser\User Data",
@@ -50,85 +53,18 @@ def _achar_brave() -> str:
 
 BRAVE_EXE       = _achar_brave()
 TIMEOUT         = 25_000
-CPF_ACESSO      = "70958933146"
-SENHA_ACESSO    = "Capi095@"
 
-# Pausa rápida a cada N clientes (simula humano virando a página, não dorme)
+# Intervalo de processamento entre lotes
 BURST_MIN    = 8
 BURST_MAX    = 12
 DESCANSO_MIN = 45    # segundos
 DESCANSO_MAX = 70    # segundos
 
-# JS de stealth injetado em cada nova página — esconde todos os sinais de automação
-STEALTH_JS = """
-// Webdriver flag
-Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-
-// Chrome APIs completas (Brave expõe window.chrome mas pode estar incompleto via CDP)
-if (!window.chrome) window.chrome = {};
-if (!window.chrome.runtime) window.chrome.runtime = {};
-const _rt = window.chrome.runtime;
-if (!_rt.connect)       _rt.connect       = function(){return {onDisconnect:{addListener:function(){}},postMessage:function(){}}};
-if (!_rt.sendMessage)   _rt.sendMessage   = function(){};
-if (!_rt.getManifest)   _rt.getManifest   = function(){return {}};
-if (!_rt.onConnect)     _rt.onConnect     = {addListener:function(){}};
-if (!_rt.onMessage)     _rt.onMessage     = {addListener:function(){}};
-if (!window.chrome.loadTimes) window.chrome.loadTimes = function(){return null};
-if (!window.chrome.csi) window.chrome.csi = function(){return {startE:Date.now(),onloadT:Date.now(),pageT:1,tran:15}};
-if (!window.chrome.app) window.chrome.app = {isInstalled:false,getDetails:function(){return null},getIsInstalled:function(){return false}};
-
-// Remove rastros do CDP (Chromium DevTools Protocol)
-try { ['cdc_adoQpoasnfa76pfcZLmcfl_Array','cdc_adoQpoasnfa76pfcZLmcfl_Promise',
-       'cdc_adoQpoasnfa76pfcZLmcfl_Symbol','__playwright','__pw_manual','__webdriver_script_fn',
-       'domAutomation','domAutomationController','_phantom','callPhantom',
-       '_selenium','__driver_evaluate','__webdriver_evaluate','__selenium_evaluate',
-       '__fxdriver_evaluate','__driver_unwrapped','__webdriver_unwrapped',
-       '__selenium_unwrapped','__fxdriver_unwrapped'].forEach(k=>{try{delete window[k]}catch(e){}});
-} catch(e) {}
-
-// Permissions API (Brave normalmente ok, mas cobre o caso de CDP resetar)
-try {
-    const _origPQ = navigator.permissions.query.bind(navigator.permissions);
-    navigator.permissions.__proto__.query = (p) =>
-        p.name === 'notifications'
-            ? Promise.resolve({state: Notification.permission, onchange: null})
-            : _origPQ(p);
-} catch(e) {}
-
-// Navigator properties realistas
-const _def = (obj, prop, val) => {
-    try { Object.defineProperty(obj, prop, {get: ()=>val, configurable:true}); } catch(e) {}
-};
-_def(navigator, 'languages',         ['pt-BR','pt','en-US','en']);
-_def(navigator, 'hardwareConcurrency', 8);
-_def(navigator, 'platform',           'Win32');
-_def(navigator, 'deviceMemory',       8);
-_def(navigator, 'maxTouchPoints',     0);
-_def(navigator, 'vendor',            'Google Inc.');
-_def(navigator, 'appVersion',        '5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Brave/136');
-
-// Plugins não-vazios (browser real tem plugins)
-try {
-    const pdf = {type:'application/pdf',description:'Portable Document Format',suffixes:'pdf'};
-    const plug = {name:'Chrome PDF Plugin',description:'Portable Document Format',filename:'internal-pdf-viewer',length:1,0:pdf,item:i=>plug[i],namedItem:()=>null};
-    pdf.enabledPlugin = plug;
-    Object.defineProperty(navigator, 'plugins', {get:()=>{
-        const a = [plug]; a.item=i=>a[i]; a.namedItem=n=>a.find(p=>p.name===n)||null; a.refresh=()=>{};
-        return a;
-    }, configurable:true});
-} catch(e) {}
-"""
-
 # ---------------------------------------------------------------------------
 # CANAIS GUI (usados pela interface gráfica; no modo terminal ficam ociosos)
 # ---------------------------------------------------------------------------
 _stop_event   = threading.Event()   # GUI seta para parar o bot
-_start_event  = threading.Event()   # GUI seta quando login estiver pronto
-_otp_queue    = _queue_mod.Queue()  # GUI envia o código OTP aqui
 _status_queue = _queue_mod.Queue()  # Bot envia progresso/status para a GUI
-
-# Keepalive de sessão
-_ultimo_keepalive = 0.0
 
 logging.basicConfig(
     filename="bot_log.txt",
@@ -141,49 +77,173 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# STEALTH
-# ---------------------------------------------------------------------------
-def _aplicar_stealth(page):
-    """Aplica playwright-stealth + JS extra em uma página."""
-    try:
-        if _STEALTH_LIB:
-            stealth_sync(page)
-    except Exception:
-        pass
-    try:
-        page.add_init_script(STEALTH_JS)
-    except Exception:
-        pass
-
-
-# ---------------------------------------------------------------------------
 # HELPERS
 # ---------------------------------------------------------------------------
 def _pausa(a=0.4, b=0.9):
     time.sleep(random.uniform(a, b))
 
 
-def _mover_mouse(page):
-    """Move o mouse para posição aleatória — gera dados de movimento para o Akamai."""
-    try:
-        page.mouse.move(
-            random.randint(180, 1050),
-            random.randint(120, 660),
-        )
-    except Exception:
-        pass
+# ---------------------------------------------------------------------------
+# VALIDAÇÃO E NORMALIZAÇÃO DE DADOS (TELEFONE / NOME)
+# ---------------------------------------------------------------------------
+VALID_DDDS = {
+    "11", "12", "13", "14", "15", "16", "17", "18", "19",
+    "21", "22", "24", "27", "28",
+    "31", "32", "33", "34", "35", "37", "38",
+    "41", "42", "43", "44", "45", "46", "47", "48", "49",
+    "51", "53", "54", "55",
+    "61", "62", "63", "64", "65", "66", "67", "68", "69",
+    "71", "73", "74", "75", "77", "79",
+    "81", "82", "83", "84", "85", "86", "87", "88", "89",
+    "91", "92", "93", "94", "95", "96", "97", "98", "99",
+}
 
 
-def _keepalive(page):
-    """Faz uma requisição silenciosa para manter a sessão viva (a cada 4 min)."""
-    global _ultimo_keepalive
-    agora = time.time()
-    if agora - _ultimo_keepalive > 90:
-        try:
-            page.evaluate("fetch(window.location.href, {method:'HEAD'}).catch(()=>{})")
-        except Exception:
-            pass
-        _ultimo_keepalive = agora
+def normalizar_telefone(valor, ddd_fallback: str = "") -> str:
+    """
+    Normaliza e valida número de telefone brasileiro para preenchimento.
+
+    Regras de conformidade:
+    - Preserva os dígitos originais.
+    - Remove formatações existentes (espaços, traços, parênteses).
+    - Identifica e remove DDI 55 (ex: 5562999999999 -> 62999999999).
+    - Remove zeros de operadora/tronco à esquerda (ex: 062999999999 -> 62999999999).
+    - Valida o DDD contra a tabela oficial da Anatel (nunca aceita '00').
+    - Distingue e preserva telefones de 10 dígitos (fixo/móvel antigo) e 11 dígitos (celular).
+    - Se o número tiver 8 ou 9 dígitos e houver ddd_fallback válido, junta ambos.
+    - NUNCA gera zeros indevidos ("00") e nunca completa artificialmente.
+    - Retorna apenas a string de dígitos (10 ou 11) ou None se inválido.
+    """
+    if valor is None:
+        return None
+
+    s = str(valor).strip()
+    if not s or s.lower() in ("nan", "none", "null", "undefined"):
+        return None
+
+    if s.endswith(".0"):
+        s = s[:-2]
+
+    digits = re.sub(r"\D", "", s)
+    if not digits:
+        return None
+
+    # Se começa com 00 (ex: 0055...), remove prefixo internacional
+    if digits.startswith("00") and len(digits) > 12:
+        digits = digits[2:]
+
+    # Remove zeros de tronco à esquerda se houver DDD válido em seguida
+    while digits.startswith("0") and len(digits) > 11:
+        digits = digits[1:]
+
+    # Trata DDI 55
+    if digits.startswith("55") and len(digits) in (12, 13):
+        pos_ddi = digits[2:]
+        ddd_candidato = pos_ddi[:2]
+        if ddd_candidato in VALID_DDDS:
+            digits = pos_ddi
+
+    if len(digits) == 12 and digits.startswith("0"):
+        digits = digits[1:]
+
+    # Se tem 8 ou 9 dígitos (sem DDD), tenta ddd_fallback se fornecido e válido
+    if len(digits) in (8, 9) and ddd_fallback:
+        ddd_clean = re.sub(r"\D", "", str(ddd_fallback).strip())[:2]
+        if ddd_clean in VALID_DDDS:
+            digits = ddd_clean + digits
+
+    # Validação de tamanho (10 dígitos para fixo / 11 dígitos para celular)
+    if len(digits) not in (10, 11):
+        return None
+
+    # Validação de DDD (rejeita 00 e qualquer DDD inexistente no Brasil)
+    ddd = digits[:2]
+    if ddd not in VALID_DDDS:
+        return None
+
+    return digits
+
+
+def formatar_telefone_visual(digits: str) -> str:
+    """Retorna o telefone formatado visualmente para exibição/logs."""
+    if not digits:
+        return ""
+    if len(digits) == 11:
+        return f"({digits[:2]}) {digits[2:7]}-{digits[7:]}"
+    elif len(digits) == 10:
+        return f"({digits[:2]}) {digits[2:6]}-{digits[6:]}"
+    return digits
+
+
+def extrair_nome_linha(linha) -> str:
+    """Extrai o nome do cliente verificando variações comuns de colunas."""
+    for col in ["NOME", "NOME DO SERVIDOR", "NOME CLIENTE", "NOME_CLIENTE", "CLIENTE", "RAZAO SOCIAL", "RAZAO_SOCIAL"]:
+        if col in linha.index:
+            v = linha.get(col)
+            if v is not None and not pd.isna(v):
+                s = str(v).strip()
+                if s and s.lower() != "nan":
+                    return s
+    for col in linha.index:
+        if "NOME" in str(col).upper():
+            v = linha.get(col)
+            if v is not None and not pd.isna(v):
+                s = str(v).strip()
+                if s and s.lower() != "nan":
+                    return s
+    return "Lead"
+
+
+def extrair_telefone_linha(linha) -> str:
+    """
+    Localiza e normaliza o telefone do cliente na linha.
+    Suporta:
+    1. Coluna única (CELULAR, TELEFONE, CONTATO, WHATSAPP, TEL, FONE, NUMERO, etc.).
+    2. Colunas separadas de DDD e FONE (incluindo sufixos DDD.1, FONE.1, etc.).
+    3. Qualquer coluna de telefone/celular genérica.
+    Retorna apenas a string de 10 ou 11 dígitos normalizada e validada, ou None se inválido.
+    """
+    colunas_prioritarias = [
+        "CELULAR", "TELEFONE", "CONTATO", "WHATSAPP", "TEL", "FONE",
+        "NUMERO", "DDD + CELULAR", "TELEFONE CELULAR", "CEL", "CELULAR1", "TELEFONE1"
+    ]
+    ddd_base = str(linha.get("DDD", "")).strip()
+
+    # 1. Procura nas colunas prioritárias de número único
+    for col in colunas_prioritarias:
+        if col in linha.index:
+            v = linha.get(col)
+            norm = normalizar_telefone(v, ddd_fallback=ddd_base)
+            if norm:
+                return norm
+
+    # 2. Procura em pares DDD + FONE (com prioridade para WhatsApp se houver)
+    candidato = None
+    for i in range(8):
+        sfx = "" if i == 0 else f".{i}"
+        d = str(linha.get(f"DDD{sfx}", "")).strip()
+        f = str(linha.get(f"FONE{sfx}", "")).strip()
+        w = str(linha.get(f"POSSUI-WHATSAPP{sfx}", "0")).strip()
+        if d and f and d.lower() != "nan" and f.lower() != "nan":
+            comb = normalizar_telefone(f, ddd_fallback=d)
+            if comb:
+                if w == "1" and len(comb) == 11:
+                    return comb
+                if candidato is None:
+                    candidato = comb
+
+    if candidato:
+        return candidato
+
+    # 3. Busca genérica em qualquer coluna cujo cabeçalho lembre telefone/celular
+    for col in linha.index:
+        c_upper = str(col).upper()
+        if any(term in c_upper for term in ["CELULAR", "TELEFONE", "FONE", "CONTATO", "WHATSAPP"]) and "DDD" not in c_upper:
+            norm = normalizar_telefone(linha.get(col), ddd_fallback=ddd_base)
+            if norm:
+                return norm
+
+    return None
 
 
 def _digitar(locator, texto: str):
@@ -191,6 +251,8 @@ def _digitar(locator, texto: str):
     try:
         locator.click()
         locator.fill("")
+        locator.press("Control+a")
+        locator.press("Backspace")
         locator.type(texto, delay=random.randint(38, 72))
     except Exception:
         locator.fill(texto)
@@ -199,6 +261,35 @@ def _digitar(locator, texto: str):
 # ---------------------------------------------------------------------------
 # SESSÃO / URL
 # ---------------------------------------------------------------------------
+class AcessoSantanderNegado(RuntimeError):
+    pass
+
+
+def _verificar_acesso_santander(ctx):
+    """Interrompe o fluxo se o Santander exibir uma página de acesso negado."""
+    textos_negado = {"access denied", "acesso negado"}
+    for aba in ctx.pages:
+        if urlsplit(aba.url).hostname not in _HOSTS_SANTANDER:
+            continue
+        try:
+            if aba.title().strip().casefold() not in textos_negado:
+                cabecalhos = aba.locator("h1").all_text_contents()
+                if not any(t.strip().casefold() in textos_negado for t in cabecalhos):
+                    continue
+        except PlaywrightError:
+            continue  # A aba pode ter sido fechada ou redirecionada.
+
+        mensagem = "O Santander negou o acesso. Se o erro persistir no login manual, contate o suporte do portal."
+        try:
+            corpo = aba.locator("body").text_content(timeout=1000) or ""
+        except PlaywrightError:
+            corpo = ""
+        referencia = re.search(r"\bReference\s+#([a-z0-9]+(?:\.[a-z0-9]+)+)\b", corpo, re.IGNORECASE)
+        if referencia:
+            mensagem += f" Referência do Santander #{referencia[1]}."
+        raise AcessoSantanderNegado(mensagem)
+
+
 def _url_real(page) -> str:
     """URL real via JS — captura pushState do Angular SPA."""
     try:
@@ -216,11 +307,27 @@ def _encontrar_pagina_formulario(ctx):
     """Varre todas as abas e retorna a primeira com o formulário."""
     for p in ctx.pages:
         try:
-            url = _url_real(p).lower()
-            if "recommendation" in url and "landing" not in url and "login" not in url and "logout" not in url:
+            url = urlsplit(_url_real(p))
+            if (
+                (url.scheme, url.netloc) == (_PORTAL.scheme, _PORTAL.netloc)
+                and url.path.rstrip("/") == _PORTAL.path.rstrip("/")
+            ):
                 return p
         except Exception:
             continue
+    return None
+
+
+def _aguardar_formulario_autenticado(ctx, timeout=None):
+    prazo = None if timeout is None else time.monotonic() + timeout
+    while not _stop_event.is_set() and ctx.pages:
+        _verificar_acesso_santander(ctx)
+        formulario = _encontrar_pagina_formulario(ctx)
+        if formulario is not None:
+            return formulario
+        if prazo is not None and time.monotonic() >= prazo:
+            return None
+        _stop_event.wait(1)
     return None
 
 
@@ -228,348 +335,44 @@ def _achar_pagina_login(ctx):
     """Retorna a aba de login (openid-connect / keycloak / /login)."""
     for p in ctx.pages:
         try:
-            url = p.url.lower()
-            if any(k in url for k in ["openid", "/login", "corp/protocol", "keycloak", "/auth?"]):
+            url = urlsplit(p.url)
+            if url.scheme == "https" and url.hostname in _HOSTS_SANTANDER and any(
+                k in url.path.lower() for k in ("openid", "/login", "corp/protocol", "keycloak", "/auth")
+            ):
                 return p
         except Exception:
             pass
     return None
 
 
-# ---------------------------------------------------------------------------
-# AUTO-LOGIN
-# ---------------------------------------------------------------------------
-def _preencher_input_angular(page, seletores: list, valor: str) -> bool:
-    """Preenche input Angular via fill + disparo de eventos nativos como fallback."""
-    for sel in seletores:
-        try:
-            loc = page.locator(sel).first
-            loc.click(force=True, timeout=2000)
-            time.sleep(0.2)
-            loc.fill(valor, force=True)
-            page.evaluate(f"""
-                const el = document.querySelector('{sel}');
-                if (el) {{
-                    const s = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                    s.call(el, {repr(valor)});
-                    el.dispatchEvent(new Event('input',  {{bubbles:true}}));
-                    el.dispatchEvent(new Event('change', {{bubbles:true}}));
-                    el.dispatchEvent(new Event('blur',   {{bubbles:true}}));
-                }}
-            """)
-            return True
-        except Exception:
-            pass
-    return False
-
-
-def _clicar_acessar_portal(page) -> bool:
-    """Clica no botão Acessar o Portal. Retorna True se clicou."""
-    for sel in [
-        'button:has-text("Acessar o Portal")',
-        'a:has-text("Acessar o Portal")',
-        ':has-text("Acessar o Portal")',
-    ]:
-        try:
-            loc = page.locator(sel).first
-            if loc.is_visible(timeout=3000):
-                loc.click()
-                return True
-        except Exception:
-            pass
-    return False
-
-
-def tentar_login_automatico(page) -> bool:
-    """
-    Tenta login automático em duas fases:
-    1. SSO silencioso — se Keycloak ainda tem sessão válida, reconecta em 2-3s sem preencher nada
-    2. Preenchimento CPF+senha — se SSO não funcionar
-    """
-    ctx = page.context
-
-    # --- Fase 1: SSO silencioso ---
-    # Clica "Acessar o Portal" e aguarda 8s para SSO redirecionar automaticamente
+def _abrir_portal(page):
     try:
-        for t in ["Continuar", "Fechar", "Ok", "Entendi", "Aceitar"]:
-            try:
-                b = page.locator(f'button:has-text("{t}")')
-                if b.count() > 0 and b.first.is_visible(timeout=200):
-                    b.first.click()
-            except Exception:
-                pass
-
-        _clicar_acessar_portal(page)
-
-        for _ in range(16):   # aguarda até 8s por SSO
-            time.sleep(0.5)
-            if _encontrar_pagina_formulario(ctx) is not None:
-                logger.info("Auto-login: SSO silencioso OK")
-                print("  Auto-login: SSO OK!\n", flush=True)
-                return True
-
-        logger.info("Auto-login: SSO não funcionou, tentando CPF+senha")
-    except Exception as e:
-        logger.warning(f"Auto-login fase SSO: {e}")
-
-    # --- Fase 2: preenche CPF + senha na aba de login ---
-    try:
-        lp = _achar_pagina_login(ctx)
-        if lp is None:
-            lp = page
-
-        logger.info(f"Auto-login: preenchendo form em {lp.url[:80]}")
-        _aplicar_stealth(lp)
-
-        try:
-            lp.wait_for_selector('input', timeout=8000)
-        except Exception:
-            return False
-        time.sleep(0.8)
-
-        try:
-            lp.keyboard.press("Escape")
-            time.sleep(0.2)
-        except Exception:
-            pass
-
-        # --- Preenche CPF via Shadow DOM (campo id="inputUser") ---
-        cpf_ok = False
-
-        # Tenta direto pelo id (fora do shadow root ou shadow open)
-        for sel in ['input#inputUser', 'input[id="inputUser"]', 'input[type="text"]']:
-            try:
-                loc = lp.locator(sel).first
-                if loc.is_visible(timeout=2000):
-                    loc.click(force=True)
-                    time.sleep(0.15)
-                    loc.fill(CPF_ACESSO)
-                    cpf_ok = True
-                    break
-            except Exception:
-                pass
-
-        # Fallback: injeta via JS percorrendo todos os shadow roots da página
-        if not cpf_ok:
-            try:
-                result = lp.evaluate(f"""
-                    (function() {{
-                        function findInShadow(root, id) {{
-                            const el = root.querySelector && root.querySelector('#' + id);
-                            if (el) return el;
-                            const all = root.querySelectorAll && root.querySelectorAll('*');
-                            if (!all) return null;
-                            for (const node of all) {{
-                                if (node.shadowRoot) {{
-                                    const found = findInShadow(node.shadowRoot, id);
-                                    if (found) return found;
-                                }}
-                            }}
-                            return null;
-                        }}
-                        const el = findInShadow(document, 'inputUser');
-                        if (!el) return false;
-                        el.focus();
-                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                        setter.call(el, {repr(CPF_ACESSO)});
-                        el.dispatchEvent(new Event('input',  {{bubbles:true}}));
-                        el.dispatchEvent(new Event('change', {{bubbles:true}}));
-                        el.dispatchEvent(new Event('blur',   {{bubbles:true}}));
-                        return true;
-                    }})()
-                """)
-                cpf_ok = bool(result)
-            except Exception:
-                pass
-
-        if not cpf_ok:
-            logger.warning("Auto-login: campo CPF não encontrado")
-            return False
-
-        time.sleep(0.5)
-
-        # --- Preenche Senha ---
-        senha_ok = False
-        for sel in ['input[type="password"]', 'input[id*="senha"]',
-                    'input[name*="senha"]', 'input[formcontrolname*="senha"]',
-                    'input[formcontrolname*="password"]']:
-            try:
-                loc = lp.locator(sel).first
-                if loc.is_visible(timeout=2000):
-                    loc.click(force=True)
-                    time.sleep(0.15)
-                    loc.fill(SENHA_ACESSO)
-                    senha_ok = True
-                    break
-            except Exception:
-                pass
-
-        if not senha_ok:
-            # Fallback shadow DOM para senha
-            try:
-                result = lp.evaluate(f"""
-                    (function() {{
-                        function findInShadow(root, type) {{
-                            const el = root.querySelector && root.querySelector('input[type="' + type + '"]');
-                            if (el) return el;
-                            const all = root.querySelectorAll && root.querySelectorAll('*');
-                            if (!all) return null;
-                            for (const node of all) {{
-                                if (node.shadowRoot) {{
-                                    const found = findInShadow(node.shadowRoot, type);
-                                    if (found) return found;
-                                }}
-                            }}
-                            return null;
-                        }}
-                        const el = findInShadow(document, 'password');
-                        if (!el) return false;
-                        el.focus();
-                        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
-                        setter.call(el, {repr(SENHA_ACESSO)});
-                        el.dispatchEvent(new Event('input',  {{bubbles:true}}));
-                        el.dispatchEvent(new Event('change', {{bubbles:true}}));
-                        el.dispatchEvent(new Event('blur',   {{bubbles:true}}));
-                        return true;
-                    }})()
-                """)
-                senha_ok = bool(result)
-            except Exception:
-                pass
-
-        if not senha_ok:
-            logger.warning("Auto-login: campo senha não encontrado")
-            return False
-
-        time.sleep(0.5)
-
-        for sel in ['button[type="submit"]', 'button:has-text("Entrar")',
-                    'button:has-text("Acessar")', 'button:has-text("Login")',
-                    'input[type="submit"]']:
-            try:
-                b = lp.locator(sel).first
-                if b.is_visible(timeout=800):
-                    b.click()
-                    break
-            except Exception:
-                pass
-
-        print("  Auto-login: aguardando resposta...", flush=True)
-        otp_avisado = False
-        for seg in range(90):
-            time.sleep(1)
-            if _encontrar_pagina_formulario(ctx) is not None:
-                logger.info("Auto-login: CPF+senha OK")
-                print("  Auto-login: OK!\n", flush=True)
-                _status_queue.put({"type": "login_ok"})
-                return True
-
-            # Detecta tela de OTP
-            if not otp_avisado:
-                try:
-                    for p2 in ctx.pages:
-                        if p2.locator('input[maxlength="1"]').count() >= 4:
-                            otp_avisado = True
-                            _status_queue.put({"type": "otp_needed"})
-                            print("\n  CÓDIGO OTP necessário — digite na interface ou no Brave!\n")
-                            try:
-                                import winsound
-                                for _ in range(3):
-                                    winsound.Beep(1000, 400)
-                                    time.sleep(0.15)
-                            except Exception:
-                                pass
-                            break
-                except Exception:
-                    pass
-
-            # Tenta pegar OTP da fila (enviado pela GUI)
-            try:
-                otp_code = _otp_queue.get_nowait()
-                for p2 in ctx.pages:
-                    try:
-                        inputs1 = p2.locator('input[maxlength="1"]')
-                        inputs6 = p2.locator('input[maxlength="6"]')
-                        if inputs1.count() >= 4:
-                            for i, ch in enumerate(otp_code[:inputs1.count()]):
-                                inputs1.nth(i).fill(ch)
-                        elif inputs6.count() > 0:
-                            inputs6.first.fill(otp_code)
-                        # Tenta submeter
-                        for sel in ['button[type="submit"]', 'button:has-text("Confirmar")',
-                                    'button:has-text("Verificar")', 'button:has-text("Entrar")']:
-                            b = p2.locator(sel).first
-                            if b.is_visible(timeout=500):
-                                b.click()
-                                break
-                        break
-                    except Exception:
-                        pass
-            except _queue_mod.Empty:
-                pass
-
-            if seg % 20 == 19:
-                print(f"  Aguardando login... ({90-seg-1}s)", flush=True)
-
-        return False
-
-    except Exception as e:
-        logger.warning(f"Auto-login fase CPF: {e}")
-        return False
+        page.goto(URL_LANDING, wait_until="domcontentloaded", timeout=15_000)
+    except PlaywrightTimeoutError:
+        # A página pode completar o carregamento enquanto o bot aguarda o login.
+        pass
 
 
 def aguardar_relogin(page):
-    """Tenta auto-login; se falhar aguarda login manual."""
+    """Aguarda o operador recuperar a sessão pelo portal."""
     ctx = page.context
+    _verificar_acesso_santander(ctx)
+    if _stop_event.is_set():
+        return None
 
-    found = _encontrar_pagina_formulario(ctx)
-    if found is not None:
-        return found
+    encontrada = _encontrar_pagina_formulario(ctx)
+    if encontrada is not None:
+        return encontrada
 
-    logger.warning(f"Sessão expirada. URL: {_url_real(page)}")
     _status_queue.put({"type": "sessao_expirada"})
-    print(f"\n{'='*50}")
-    print("  SESSÃO EXPIRADA — tentando login automático...")
-    print(f"{'='*50}\n")
+    print(f"Sessão expirada. {_ORIENTACAO_LOGIN}", flush=True)
+    if _achar_pagina_login(ctx) is None and not urlsplit(page.url).path.endswith("/landing-page"):
+        _abrir_portal(page)
 
-    try:
-        if "landing" not in _url_real(page).lower():
-            page.goto(URL_LANDING, wait_until="domcontentloaded", timeout=15_000)
-            time.sleep(2)
-    except Exception:
-        pass
-
-    if tentar_login_automatico(page):
-        found = _encontrar_pagina_formulario(ctx)
-        if found is not None:
-            return found
-
-    print(f"\n{'='*50}")
-    print("  Auto-login falhou. Faça login manualmente no Brave.")
-    print(f"{'='*50}\n")
-
-    for segundo in range(7200):
-        if segundo % 5 == 0:
-            found = _encontrar_pagina_formulario(ctx)
-            if found is not None:
-                print("  Formulário detectado! Continuando...\n")
-                logger.info("Sessão recuperada manualmente.")
-                return found
-
-        if segundo > 0 and segundo % 300 == 0:
-            try:
-                page.goto(URL_LANDING, wait_until="domcontentloaded", timeout=15_000)
-                time.sleep(2)
-                if tentar_login_automatico(page):
-                    found = _encontrar_pagina_formulario(ctx)
-                    if found is not None:
-                        return found
-            except Exception:
-                pass
-
-        time.sleep(1)
-
-    return None
+    encontrada = _aguardar_formulario_autenticado(ctx, timeout=7200)
+    if encontrada is not None:
+        _status_queue.put({"type": "login_ok"})
+    return encontrada
 
 
 # ---------------------------------------------------------------------------
@@ -630,33 +433,42 @@ def carregar_dados() -> pd.DataFrame:
 # FORMULÁRIO
 # ---------------------------------------------------------------------------
 def aguardar_formulario(page):
-    for tentativa in range(3):
+    for tentativa in range(4):
         try:
-            page.wait_for_selector('label', timeout=12_000)
-            if page.locator('label').filter(has_text="Nome").count() > 0:
+            # 1. Se já está visível o campo "Nome PF ou Sócio", já estamos no formulário de simulação!
+            lbl_nome = page.locator('label').filter(has_text="Nome")
+            if lbl_nome.count() > 0 and lbl_nome.first.is_visible():
                 return
-            time.sleep(2)
+
+            # 2. Se estiver na tela inicial do portal com o card "Ver produtos" / "O produto ideal está aqui", clica nele
+            card_btn = page.locator(':has-text("Ver produtos")').filter(has_text="Ver produtos").last
+            if card_btn.count() > 0 and card_btn.is_visible():
+                try:
+                    card_btn.click()
+                    time.sleep(1.5)
+                except Exception:
+                    pass
+                if page.locator('label').filter(has_text="Nome").count() > 0:
+                    return
+
+            page.wait_for_selector('label:has-text("Nome")', timeout=6_000)
             if page.locator('label').filter(has_text="Nome").count() > 0:
-                return
-            if page.locator('button:has-text("Ver produtos")').count() > 0:
                 return
         except PlaywrightTimeoutError:
             pass
-        if tentativa < 2:
-            time.sleep(3)
-    raise PlaywrightTimeoutError("Formulário não encontrado após 3 tentativas")
-
+        except Exception:
+            pass
+        if tentativa < 3:
+            time.sleep(2)
+    raise PlaywrightTimeoutError("Formulário não encontrado após tentativas")
 
 def preencher_formulario(page, nome: str, cpf: str, telefone: str):
     aguardar_formulario(page)
     _pausa()
-    _mover_mouse(page)
     _digitar(page.get_by_label("Nome PF ou Sócio"), nome)
     _pausa()
-    _mover_mouse(page)
     _digitar(page.get_by_label("CPF ou CNPJ"), cpf)
     _pausa()
-    _mover_mouse(page)
     _digitar(page.get_by_label("DDD + Celular"), telefone)
     _pausa()
     page.locator('button:has-text("Ver produtos")').click()
@@ -667,7 +479,6 @@ def preencher_formulario(page, nome: str, cpf: str, telefone: str):
 # ---------------------------------------------------------------------------
 def clicar_simular_consignado(page):
     page.wait_for_selector('text=Vitrine de produtos', timeout=TIMEOUT)
-    _mover_mouse(page)
     _pausa()
 
     if page.locator('text=Produto não disponível').count() > 0:
@@ -740,7 +551,6 @@ def fechar_modais(page):
 
 def verificar_refinanciamento(page) -> str:
     page.wait_for_selector('text=Simulação de empréstimo consignado', timeout=TIMEOUT)
-    _mover_mouse(page)
     _pausa()
     try:
         page.wait_for_selector('text=Simular Refinanciamento', timeout=2500)
@@ -762,30 +572,40 @@ def _confirmar_cancelamento(page):
 
 def _no_formulario(page) -> bool:
     try:
-        return page.locator('button:has-text("Ver produtos")').is_visible()
+        lbl_nome = page.locator('label').filter(has_text="Nome")
+        return lbl_nome.count() > 0 and lbl_nome.first.is_visible()
     except Exception:
         return False
 
-
 def voltar_ao_formulario(page):
+    _verificar_acesso_santander(page.context)
+    if sessao_expirada(page):
+        return
     _confirmar_cancelamento(page)
     if _no_formulario(page):
         return
     for _ in range(4):
         try:
             page.go_back(wait_until="domcontentloaded", timeout=5000)
-            time.sleep(0.8)
-            _confirmar_cancelamento(page)
-            if _no_formulario(page):
-                return
-        except Exception:
+        except PlaywrightError:
             break
+        _verificar_acesso_santander(page.context)
+        if sessao_expirada(page):
+            return
+        time.sleep(0.8)
+        _confirmar_cancelamento(page)
+        if _no_formulario(page):
+            return
+    _verificar_acesso_santander(page.context)
+    if sessao_expirada(page):
+        return
     if not _no_formulario(page):
         try:
             page.goto(URL_FORMULARIO, wait_until="domcontentloaded", timeout=15_000)
             time.sleep(1.5)
         except Exception:
             pass
+        _verificar_acesso_santander(page.context)
 
 
 def _fechar_abas_extras(ctx, page_principal):
@@ -833,10 +653,8 @@ def processar_clientes(page, df: pd.DataFrame) -> pd.DataFrame:
         if ja_feito and ja_feito != "nan" and ja_feito != "Erro":
             continue
 
-        nome    = str(linha.get("NOME", "Lead")).strip() or "Lead"
+        nome    = extrair_nome_linha(linha)
         cpf_raw = str(linha.get("CPF/CNPJ", "")).strip()
-        ddd     = str(linha.get("DDD", "")).strip()
-        fone    = str(linha.get("FONE", "")).strip()
 
         # CPF pode ter 14 dígitos nesta planilha (CPF preenchido com zeros à esquerda)
         _cpf_digits = "".join(ch for ch in cpf_raw if ch.isdigit())
@@ -846,37 +664,25 @@ def processar_clientes(page, df: pd.DataFrame) -> pd.DataFrame:
         else:
             cpf = _cpf_digits.zfill(11)
 
-        # Busca melhor telefone: prioriza celular com WhatsApp em múltiplas colunas
-        telefone = None
-        for _i in range(8):
-            _sfx = "" if _i == 0 else f".{_i}"
-            _d = str(linha.get(f"DDD{_sfx}", "")).strip()
-            _f = str(linha.get(f"FONE{_sfx}", "")).strip()
-            _w = str(linha.get(f"POSSUI-WHATSAPP{_sfx}", "0")).strip()
-            if _d and _f and _d != "nan" and _f != "nan":
-                _comb = "".join(ch for ch in (_d + _f) if ch.isdigit())
-                if len(_comb) == 11 and _comb[2] == "9":
-                    if _w == "1":
-                        telefone = _comb
-                        break
-                    if telefone is None:
-                        telefone = _comb
-        if telefone is None:
-            _ddd2 = "".join(ch for ch in ddd if ch.isdigit())[:2].zfill(2)
-            telefone = _ddd2 + "999999999"
-
         if len(cpf) != 11:
             df.at[idx, "Tem_Emprestimo"] = "CPF Inválido"
             salvar_excel(df, ARQUIVO_SAIDA)
             print(f"[{idx+1}/{total}] CPF inválido, pulando.")
             continue
 
-        print(f"[{idx+1}/{total}] {nome[:28]:<28} CPF: {cpf} ...", end=" ", flush=True)
-        logger.info(f"[{idx+1}/{total}] {nome} CPF: {cpf}")
+        telefone = extrair_telefone_linha(linha)
+        if not telefone:
+            df.at[idx, "Tem_Emprestimo"] = "Telefone Inválido"
+            salvar_excel(df, ARQUIVO_SAIDA)
+            print(f"[{idx+1}/{total}] Telefone ausente/inválido, pulando.")
+            logger.warning(f"[{idx+1}/{total}] {nome} CPF: {cpf} - Telefone inválido")
+            continue
 
-        _keepalive(page)
-        _fechar_abas_extras(page.context, page)
+        fone_fmt = formatar_telefone_visual(telefone)
+        print(f"[{idx+1}/{total}] {nome[:24]:<24} CPF: {cpf} Tel: {fone_fmt} ...", end=" ", flush=True)
+        logger.info(f"[{idx+1}/{total}] {nome} CPF: {cpf} Tel: {fone_fmt}")
 
+        _verificar_acesso_santander(page.context)
         if sessao_expirada(page):
             nova = aguardar_relogin(page)
             if nova is None:
@@ -885,21 +691,28 @@ def processar_clientes(page, df: pd.DataFrame) -> pd.DataFrame:
             processados_no_burst = 0
             proximo_descanso = random.randint(BURST_MIN, BURST_MAX)
 
+        _fechar_abas_extras(page.context, page)
+
         # Pausa entre clientes
         time.sleep(random.uniform(4.0, 7.0))
 
         status = "Erro"
         for tentativa in range(2):
+            _verificar_acesso_santander(page.context)
             try:
                 preencher_formulario(page, nome, cpf, telefone)
                 clicar_simular_consignado(page)
                 fechar_modais(page)
                 status = verificar_refinanciamento(page)
+                _verificar_acesso_santander(page.context)
                 print(status)
                 logger.info(f"  → {status}")
                 break
 
+            except AcessoSantanderNegado:
+                raise
             except PlaywrightTimeoutError as e:
+                _verificar_acesso_santander(page.context)
                 msg = str(e).splitlines()[0][:60]
                 logger.warning(f"  TIMEOUT t{tentativa+1} [{idx+1}]: {msg}")
                 if tentativa == 0:
@@ -907,8 +720,7 @@ def processar_clientes(page, df: pd.DataFrame) -> pd.DataFrame:
                     if sessao_expirada(page):
                         nova = aguardar_relogin(page)
                         if nova is None:
-                            status = "Erro"
-                            break
+                            return df
                         page = nova
                         processados_no_burst = 0
                     else:
@@ -918,6 +730,7 @@ def processar_clientes(page, df: pd.DataFrame) -> pd.DataFrame:
                     status = "Erro"
 
             except Exception as e:
+                _verificar_acesso_santander(page.context)
                 msg = str(e)
                 logger.warning(f"  ERRO t{tentativa+1} [{idx+1}]: {msg}")
                 if "não disponível" in msg.lower() or "consórcio" in msg.lower():
@@ -929,8 +742,7 @@ def processar_clientes(page, df: pd.DataFrame) -> pd.DataFrame:
                     if sessao_expirada(page):
                         nova = aguardar_relogin(page)
                         if nova is None:
-                            status = "Erro"
-                            break
+                            return df
                         page = nova
                         processados_no_burst = 0
                     else:
@@ -952,10 +764,11 @@ def processar_clientes(page, df: pd.DataFrame) -> pd.DataFrame:
             "total":  total,
             "nome":   nome,
             "cpf":    cpf,
+            "fone":   fone_fmt,
             "status": status,
             "sim":    int((df["Tem_Emprestimo"] == "Sim").sum()),
             "nao":    int((df["Tem_Emprestimo"] == "Não").sum()),
-            "erros":  int(df["Tem_Emprestimo"].isin(["Erro", "CPF Inválido"]).sum()),
+            "erros":  int(df["Tem_Emprestimo"].isin(["Erro", "CPF Inválido", "Telefone Inválido"]).sum()),
         })
 
         voltar_ao_formulario(page)
@@ -974,10 +787,36 @@ def processar_clientes(page, df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# MAIN GUI (chamado pela interface gráfica)
+# INICIALIZAÇÃO (interface gráfica e terminal)
 # ---------------------------------------------------------------------------
+def _executar_no_portal(df):
+    _status_queue.put({"type": "log", "msg": "Abrindo Brave..."})
+    with sync_playwright() as pw:
+        ctx = pw.chromium.launch_persistent_context(
+            user_data_dir=PERFIL_DIR,
+            executable_path=BRAVE_EXE,
+            headless=False,
+            locale="pt-BR",
+            no_viewport=True,
+        )
+        try:
+            page = ctx.pages[0] if ctx.pages else ctx.new_page()
+            _abrir_portal(page)
+            _status_queue.put({"type": "aguardando_login"})
+            print(_ORIENTACAO_LOGIN, flush=True)
+
+            page = _aguardar_formulario_autenticado(ctx)
+            if page is None:
+                return None
+
+            _status_queue.put({"type": "rodando"})
+            return processar_clientes(page, df)
+        finally:
+            ctx.close()
+
+
 def main_gui():
-    """Versão sem input() — sincroniza com a GUI via _start_event e _status_queue."""
+    """Executa o bot em segundo plano e envia o progresso para a interface."""
     df = carregar_dados()
 
     # Envia contagens iniciais do arquivo já existente
@@ -994,74 +833,9 @@ def main_gui():
         "erros":  erros0,
     })
 
-    _status_queue.put({"type": "log", "msg": "Abrindo Brave..."})
-
-    with sync_playwright() as pw:
-        ctx = pw.chromium.launch_persistent_context(
-            user_data_dir=PERFIL_DIR,
-            executable_path=BRAVE_EXE,
-            headless=False,
-            ignore_default_args=["--enable-automation"],
-            args=["--no-first-run", "--lang=pt-BR",
-                  "--disable-blink-features=AutomationControlled"],
-            viewport={"width": 1280, "height": 800},
-            locale="pt-BR",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/136.0.0.0 Safari/537.36 Brave/136"
-            ),
-        )
-        ctx.add_init_script(STEALTH_JS)
-        ctx.on("page", lambda p: _aplicar_stealth(p))
-
-        # Fecha automaticamente qualquer nova aba que não seja login
-        def _auto_fechar_aba(nova_aba):
-            _aplicar_stealth(nova_aba)
-            def _checar():
-                time.sleep(1.5)
-                try:
-                    url = nova_aba.url.lower()
-                    if not any(k in url for k in ["openid", "/login", "corp/protocol",
-                                                   "keycloak", "/auth?", "recommendation",
-                                                   "parceirosantander", "landing"]):
-                        nova_aba.close()
-                except Exception:
-                    pass
-            threading.Thread(target=_checar, daemon=True).start()
-
-        ctx.on("page", _auto_fechar_aba)
-
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        _aplicar_stealth(page)
-
-        # Vai para landing page (sempre acessível, sem session_code que expira)
-        try:
-            page.goto(URL_LANDING, wait_until="domcontentloaded", timeout=15_000)
-        except Exception:
-            pass
-
-        _status_queue.put({"type": "aguardando_login"})
-
-        # Tenta SSO silencioso imediatamente
-        if not _stop_event.is_set():
-            tentar_login_automatico(page)
-
-        # Aguarda formulário aparecer (auto-detecta a cada 2s)
-        while not _stop_event.is_set():
-            found = _encontrar_pagina_formulario(ctx)
-            if found is not None:
-                page = found
-                break
-            time.sleep(2)
-
-        if _stop_event.is_set():
-            ctx.close()
-            return
-
-        _status_queue.put({"type": "rodando"})
-        df = processar_clientes(page, df)
-        ctx.close()
+    df = _executar_no_portal(df)
+    if df is None:
+        return
 
     salvar_excel(df, ARQUIVO_SAIDA)
     sim   = (df["Tem_Emprestimo"] == "Sim").sum()
@@ -1069,7 +843,6 @@ def main_gui():
     erros = df["Tem_Emprestimo"].isin(["Erro", "CPF Inválido"]).sum()
     _status_queue.put({"type": "log",
                        "msg": f"Concluído! Sim={sim} | Não={nao} | Erros={erros}"})
-    _status_queue.put({"type": "stopped"})
 
 
 # ---------------------------------------------------------------------------
@@ -1077,64 +850,12 @@ def main_gui():
 # ---------------------------------------------------------------------------
 def main():
     df = carregar_dados()
-
-    print("Abrindo Brave...")
-    with sync_playwright() as pw:
-        ctx = pw.chromium.launch_persistent_context(
-            user_data_dir=PERFIL_DIR,
-            executable_path=BRAVE_EXE,
-            headless=False,
-            ignore_default_args=["--enable-automation"],
-            args=[
-                "--no-first-run",
-                "--lang=pt-BR",
-                "--disable-blink-features=AutomationControlled",
-            ],
-            viewport={"width": 1280, "height": 800},
-            locale="pt-BR",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/136.0.0.0 Safari/537.36 Brave/136"
-            ),
-        )
-
-        ctx.add_init_script(STEALTH_JS)
-
-        # Aplica stealth em toda nova aba que abrir + fecha abas indesejadas
-        ctx.on("page", lambda p: _aplicar_stealth(p))
-
-        def _auto_fechar_aba_terminal(nova_aba):
-            def _checar():
-                time.sleep(1.5)
-                try:
-                    url = nova_aba.url.lower()
-                    if not any(k in url for k in ["openid", "/login", "corp/protocol",
-                                                   "keycloak", "/auth?", "recommendation",
-                                                   "parceirosantander", "landing"]):
-                        nova_aba.close()
-                except Exception:
-                    pass
-            threading.Thread(target=_checar, daemon=True).start()
-
-        ctx.on("page", _auto_fechar_aba_terminal)
-
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        _aplicar_stealth(page)
-        page.goto(URL_FORMULARIO)
-
-        print("\nFaça o login no Brave se necessário.")
-        print("Quando estiver no formulário (Nome/CPF/Celular), pressione ENTER.")
-        input()
-
-        encontrada = _encontrar_pagina_formulario(ctx)
-        if encontrada:
-            page = encontrada
-
-        status_stealth = "OK" if _STEALTH_LIB else "não instalado"
-        print(f"Iniciando... (stealth: {status_stealth}, burst: {BURST_MIN}-{BURST_MAX} clientes)\n")
-        df = processar_clientes(page, df)
-        ctx.close()
+    try:
+        df = _executar_no_portal(df)
+    except AcessoSantanderNegado as e:
+        raise SystemExit(str(e)) from None
+    if df is None:
+        return
 
     salvar_excel(df, ARQUIVO_SAIDA)
     print(f"\nConcluído! Salvo em '{ARQUIVO_SAIDA}'.")

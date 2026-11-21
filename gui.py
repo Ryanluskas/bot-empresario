@@ -28,7 +28,6 @@ C_RED2  = "#a80000"
 C_GREEN = "#3A9D5C"
 C_AMBER = "#C18A1A"
 C_ERR   = "#C0392B"
-C_BLUE  = "#1A5FA8"
 
 
 class BotApp(ctk.CTk):
@@ -123,18 +122,15 @@ class BotApp(ctk.CTk):
     def _build_metrics(self, parent):
         row = ctk.CTkFrame(parent, fg_color="transparent")
         row.pack(fill="x", pady=(0, 10))
-        for i in range(4):
-            row.columnconfigure(i, weight=1)
-
         specs = [
             ("total",  "TOTAL NA LISTA",    C_TEXT,   "clientes carregados"),
             ("feitos", "PROCESSADOS",        C_GREEN,  "—"),
             ("erros",  "ERROS",              C_ERR,    "CPF inválido / timeout"),
-            ("otp",    "AGUARDANDO OTP",     C_AMBER,  "aguardando código SMS"),
         ]
         self._mv  = {}
         self._msv = {}
         for i, (k, lbl, clr, sub) in enumerate(specs):
+            row.columnconfigure(i, weight=1)
             pad_left = 6 if i > 0 else 0
             card = ctk.CTkFrame(row, fg_color=C_CARD, corner_radius=10,
                                  border_color=C_BORDER, border_width=1)
@@ -286,8 +282,7 @@ class BotApp(ctk.CTk):
 
         self._switches = {}
         for lbl, on in [("Retentar em erro", True),
-                         ("Fechar abas extras", True),
-                         ("Modo stealth", True)]:
+                         ("Fechar abas extras", True)]:
             r = ctk.CTkFrame(cfg, fg_color="transparent")
             r.pack(fill="x", padx=16)
             ctk.CTkFrame(r, height=1, fg_color=C_BORDER).pack(fill="x")
@@ -383,31 +378,12 @@ class BotApp(ctk.CTk):
         tb.tag_configure("err",  foreground=C_ERR)
         tb.tag_configure("info", foreground="#5B9CF6")
         tb.tag_configure("warn", foreground=C_AMBER)
-        tb.tag_configure("otp",  foreground=C_AMBER)
         tb.tag_configure("ts",   foreground=C_TEXT3)
 
     def _build_bottom(self):
         bar = ctk.CTkFrame(self, height=52, fg_color=C_CARD, corner_radius=0)
         bar.pack(fill="x")
         bar.pack_propagate(False)
-
-        inner = ctk.CTkFrame(bar, fg_color="transparent")
-        inner.pack(side="left", padx=16, pady=10)
-
-        ctk.CTkLabel(inner, text="OTP:",
-                     font=ctk.CTkFont(size=12), text_color=C_TEXT2
-                     ).pack(side="left", padx=(0, 6))
-        self._otp_entry = ctk.CTkEntry(inner, width=100,
-                                        placeholder_text="123456",
-                                        font=ctk.CTkFont(size=13),
-                                        fg_color=C_CARD2, border_color=C_BORDER)
-        self._otp_entry.pack(side="left")
-        self._otp_entry.bind("<Return>", lambda e: self._enviar_otp())
-
-        ctk.CTkButton(inner, text="Enviar", width=70, height=32,
-                       fg_color=C_BLUE, hover_color="#163e6b",
-                       font=ctk.CTkFont(size=12),
-                       command=self._enviar_otp).pack(side="left", padx=(6, 0))
 
         self._lbl_cliente = ctk.CTkLabel(bar, text="Aguardando...",
                                           font=ctk.CTkFont(size=11),
@@ -426,13 +402,12 @@ class BotApp(ctk.CTk):
             return
         self._running = True
         bot._stop_event.clear()
-        bot._start_event.clear()
 
         self._btn_main.configure(
             text="⏸  Pausar", fg_color=C_CARD2, hover_color=C_BORDER,
             border_color=C_BORDER, border_width=1, text_color=C_TEXT
         )
-        self._set_status("Executando", C_GREEN, anim=True)
+        self._set_status("Abrindo portal...", C_AMBER, anim=True)
         self._log_line("info", "Bot iniciado")
         self._inicio = time.time()
         self._proc_sess = 0
@@ -442,14 +417,6 @@ class BotApp(ctk.CTk):
         bot._stop_event.set()
         self._set_status("Parando...", C_AMBER, anim=False)
         self._log_line("warn", "Parada solicitada")
-
-    def _enviar_otp(self):
-        code = self._otp_entry.get().strip()
-        if code:
-            bot._otp_queue.put(code)
-            self._otp_entry.delete(0, "end")
-            self._log_line("info", f"OTP enviado: {code}")
-            self._mv["otp"].set("0")
 
     def _abrir_resultados(self):
         p = os.path.abspath("resultado_filtrado.xlsx")
@@ -481,14 +448,16 @@ class BotApp(ctk.CTk):
     def _run_bot(self):
         h = _GuiHandler(bot._status_queue)
         logging.getLogger().addHandler(h)
+        erro_acesso = None
         try:
             bot.main_gui()
+        except bot.AcessoSantanderNegado as e:
+            erro_acesso = str(e)
         except Exception as e:
             bot._status_queue.put({"type": "log", "msg": f"ERRO FATAL: {e}"})
-            bot._status_queue.put({"type": "stopped"})
         finally:
             logging.getLogger().removeHandler(h)
-            self._running = False
+            bot._status_queue.put({"type": "stopped", "erro_acesso": erro_acesso})
 
     # ───────────────────────────── POLL ──────────────────────────────────────
     def _poll(self):
@@ -543,8 +512,9 @@ class BotApp(ctk.CTk):
 
             tag  = "sim" if status == "Sim" else "erro" if "Erro" in status or "Inválido" in status else "nao"
             stxt = "✓ Sim" if status == "Sim" else "✗ Não" if status == "Não" else f"⚠ {status}"
+            fone_display = item.get("fone") or "—"
             self._tree.insert("", 0,
-                              values=(nome[:34], self._mask_cpf(cpf), "—", stxt),
+                              values=(nome[:34], self._mask_cpf(cpf), fone_display, stxt),
                               tags=(tag,))
             kids = self._tree.get_children()
             if len(kids) > 8:
@@ -565,28 +535,17 @@ class BotApp(ctk.CTk):
             self._lbl_prog.configure(text=f"{feitos} / {total}")
             self._lbl_sim_cnt.configure(text=f"✓ {item['sim']} com refinanciamento")
 
-        elif t == "otp_needed":
-            cur = int(self._mv["otp"].get() or "0")
-            self._mv["otp"].set(str(cur + 1))
-            self._set_status("OTP necessário!", C_AMBER, anim=False)
-            self._log_line("otp", "Código de verificação necessário — digite no campo OTP abaixo!")
-            self._otp_entry.focus()
-            self.lift()
-            self.attributes("-topmost", True)
-            self.after(3000, lambda: self.attributes("-topmost", False))
-            self._piscar(6)
-
         elif t == "sessao_expirada":
-            self._set_status("Reconectando...", C_AMBER, anim=True)
-            self._log_line("warn", "Sessão expirada — tentando login automático...")
+            self._set_status("Sessão expirada", C_AMBER, anim=False)
+            self._log_line("warn", "Entre novamente no portal pelo Brave para continuar.")
 
         elif t == "login_ok":
             self._set_status("Executando", C_GREEN, anim=True)
-            self._log_line("ok", "Login automático OK — continuando!")
+            self._log_line("ok", "Login concluído. Retomando o processamento.")
 
         elif t == "aguardando_login":
             self._set_status("Aguardando login", C_AMBER, anim=False)
-            self._log_line("info", "Brave aberto — faça o login. O bot detecta automaticamente.")
+            self._log_line("info", bot._ORIENTACAO_LOGIN)
 
         elif t == "rodando":
             self._set_status("Executando", C_GREEN, anim=True)
@@ -598,9 +557,15 @@ class BotApp(ctk.CTk):
                 text="▶  Iniciar", fg_color=C_RED, hover_color=C_RED2,
                 border_width=0, text_color="#fff"
             )
-            self._set_status("Parado", C_TEXT2, anim=False)
-            self._log_line("info", "Bot parado")
-            self._lbl_cliente.configure(text="Parado")
+            erro_acesso = item.get("erro_acesso")
+            if erro_acesso:
+                self._set_status("Acesso negado", C_ERR, anim=False)
+                self._log_line("err", erro_acesso)
+                self._lbl_cliente.configure(text="Acesso negado pelo Santander")
+            else:
+                self._set_status("Parado", C_TEXT2, anim=False)
+                self._log_line("info", "Bot parado")
+                self._lbl_cliente.configure(text="Parado")
 
     # ───────────────────────────── HELPERS ───────────────────────────────────
     def _mask_cpf(self, cpf: str) -> str:
@@ -637,20 +602,6 @@ class BotApp(ctk.CTk):
         tb.insert("end", msg + "\n", tag)
         self._log_box.see("end")
         self._log_box.configure(state="disabled")
-
-    def _piscar(self, n: int):
-        try:
-            import ctypes
-            hwnd = ctypes.windll.user32.GetParent(self.winfo_id()) or self.winfo_id()
-            class FI(ctypes.Structure):
-                _fields_ = [("cbSize", ctypes.c_uint), ("hwnd", ctypes.c_void_p),
-                             ("dwFlags", ctypes.c_uint), ("uCount", ctypes.c_uint),
-                             ("dwTimeout", ctypes.c_uint)]
-            ctypes.windll.user32.FlashWindowEx(ctypes.byref(
-                FI(ctypes.sizeof(FI), hwnd, 3 | 12, n, 0)))
-        except Exception:
-            pass
-
 
 class _GuiHandler(logging.Handler):
     def __init__(self, q):
